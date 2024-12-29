@@ -22,6 +22,10 @@ def init_session_state():
         st.session_state.legal_team = None
     if 'knowledge_base' not in st.session_state:
         st.session_state.knowledge_base = None
+    if 'uploaded_files' not in st.session_state:
+        st.session_state.uploaded_files = []
+    if 'processed_files' not in st.session_state:
+        st.session_state.processed_files = set()
 
 def init_qdrant():
     """Initialize Qdrant vector database"""
@@ -36,18 +40,17 @@ def init_qdrant():
             url=st.session_state.qdrant_url,
             api_key=st.session_state.qdrant_api_key,
             https=True,
-            timeout=60,  # Added explicit timeout
+            timeout=60,
             distance="cosine"
         )
         
-        # Test connection
         vector_db.client.get_collections()
         return vector_db
     except Exception as e:
         raise Exception(f"Failed to initialize Qdrant: {str(e)}")
 
-def process_document(uploaded_file, vector_db: Qdrant):
-    """Process document, create embeddings and store in Qdrant vector database"""
+def process_documents(uploaded_files, vector_db: Qdrant):
+    """Process multiple documents, create embeddings and store in Qdrant vector database"""
     if not st.session_state.openai_api_key:
         raise ValueError("OpenAI API key not provided")
         
@@ -55,18 +58,18 @@ def process_document(uploaded_file, vector_db: Qdrant):
     
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            if uploaded_file is None:
-                raise ValueError("No file uploaded")
-                
-            if uploaded_file.size > 200 * 1024 * 1024:  # 200MB limit
-                raise ValueError("File size exceeds 200MB limit")
+            if not uploaded_files:
+                raise ValueError("No files uploaded")
             
-            temp_file_path = os.path.join(temp_dir, uploaded_file.name)
-            with open(temp_file_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
-
-            if not os.path.exists(temp_file_path):
-                raise ValueError("Failed to save uploaded file")
+            # Save all files to temporary directory
+            for uploaded_file in uploaded_files:
+                if uploaded_file.size > 200 * 1024 * 1024:  # 200MB limit
+                    st.warning(f"Skipping {uploaded_file.name}: File size exceeds 200MB limit")
+                    continue
+                    
+                temp_file_path = os.path.join(temp_dir, uploaded_file.name)
+                with open(temp_file_path, "wb") as f:
+                    f.write(uploaded_file.getbuffer())
 
             embedder = OpenAIEmbedder(
                 model="text-embedding-3-small",
@@ -88,11 +91,79 @@ def process_document(uploaded_file, vector_db: Qdrant):
                 raise Exception(f"Error creating knowledge base: {str(kb_error)}")
                 
         except Exception as e:
-            error_msg = f"Error processing document: {str(e)}\n"
+            error_msg = f"Error processing documents: {str(e)}\n"
             if hasattr(e, 'response'):
                 error_msg += f"Response status: {e.response.status_code}\n"
                 error_msg += f"Response content: {e.response.content}"
             raise Exception(error_msg)
+
+def init_legal_team(knowledge_base):
+    """Initialize the legal team with given knowledge base"""
+    legal_researcher = Agent(
+        name="Legal Researcher",
+        role="Legal research specialist",
+        model=OpenAIChat(model="gpt-4o"),
+        tools=[DuckDuckGo()],
+        knowledge=knowledge_base,
+        search_knowledge=True,
+        instructions=[
+            "Find and cite relevant legal cases and precedents",
+            "Provide detailed research summaries with sources",
+            "Reference specific sections from all uploaded documents",
+            "Always search the knowledge base for relevant information"
+        ],
+        show_tool_calls=True,
+        markdown=True
+    )
+
+    contract_analyst = Agent(
+        name="Contract Analyst",
+        role="Contract analysis specialist",
+        model=OpenAIChat(model="gpt-4o"),
+        knowledge=knowledge_base,
+        search_knowledge=True,
+        instructions=[
+            "Review all contracts thoroughly",
+            "Identify key terms and potential issues",
+            "Cross-reference clauses between documents",
+            "Reference specific clauses from all documents"
+        ],
+        markdown=True
+    )
+
+    legal_strategist = Agent(
+        name="Legal Strategist", 
+        role="Legal strategy specialist",
+        model=OpenAIChat(model="gpt-4o"),
+        knowledge=knowledge_base,
+        search_knowledge=True,
+        instructions=[
+            "Develop comprehensive legal strategies",
+            "Provide actionable recommendations",
+            "Consider both risks and opportunities",
+            "Analyze relationships between multiple documents"
+        ],
+        markdown=True
+    )
+
+    return Agent(
+        name="Legal Team Lead",
+        role="Legal team coordinator",
+        model=OpenAIChat(model="gpt-4o"),
+        team=[legal_researcher, contract_analyst, legal_strategist],
+        knowledge=knowledge_base,
+        search_knowledge=True,
+        instructions=[
+            "Coordinate analysis between team members",
+            "Provide comprehensive responses",
+            "Ensure all recommendations are properly sourced",
+            "Reference specific parts of all uploaded documents",
+            "Always search the knowledge base before delegating tasks",
+            "Consider relationships and dependencies between documents"
+        ],
+        show_tool_calls=True,
+        markdown=True
+    )
 
 def main():
     st.set_page_config(page_title="Legal Document Analyzer", layout="wide")
@@ -141,89 +212,63 @@ def main():
 
         if all([st.session_state.openai_api_key, st.session_state.vector_db]):
             st.header("📄 Document Upload")
-            uploaded_file = st.file_uploader("Upload Legal Document", type=['pdf'])
             
-            if uploaded_file:
-                with st.spinner("Processing document..."):
-                    try:
-                        knowledge_base = process_document(uploaded_file, st.session_state.vector_db)
-                        st.session_state.knowledge_base = knowledge_base
-                        
-                        # Initialize agents with corrected model name
-                        legal_researcher = Agent(
-                            name="Legal Researcher",
-                            role="Legal research specialist",
-                            model=OpenAIChat(model="gpt-4o"),  # Fixed model name
-                            tools=[DuckDuckGo()],
-                            knowledge=st.session_state.knowledge_base,
-                            search_knowledge=True,
-                            instructions=[
-                                "Find and cite relevant legal cases and precedents",
-                                "Provide detailed research summaries with sources",
-                                "Reference specific sections from the uploaded document",
-                                "Always search the knowledge base for relevant information"
-                            ],
-                            show_tool_calls=True,
-                            markdown=True
-                        )
-
-                        contract_analyst = Agent(
-                            name="Contract Analyst",
-                            role="Contract analysis specialist",
-                            model=OpenAIChat(model="gpt-4o"),  # Fixed model name
-                            knowledge=knowledge_base,
-                            search_knowledge=True,
-                            instructions=[
-                                "Review contracts thoroughly",
-                                "Identify key terms and potential issues",
-                                "Reference specific clauses from the document"
-                            ],
-                            markdown=True
-                        )
-
-                        legal_strategist = Agent(
-                            name="Legal Strategist", 
-                            role="Legal strategy specialist",
-                            model=OpenAIChat(model="gpt-4o"),  # Fixed model name
-                            knowledge=knowledge_base,
-                            search_knowledge=True,
-                            instructions=[
-                                "Develop comprehensive legal strategies",
-                                "Provide actionable recommendations",
-                                "Consider both risks and opportunities"
-                            ],
-                            markdown=True
-                        )
-
-                        # Legal Agent Team
-                        st.session_state.legal_team = Agent(
-                            name="Legal Team Lead",
-                            role="Legal team coordinator",
-                            model=OpenAIChat(model="gpt-4o"),  # Fixed model name
-                            team=[legal_researcher, contract_analyst, legal_strategist],
-                            knowledge=st.session_state.knowledge_base,
-                            search_knowledge=True,
-                            instructions=[
-                                "Coordinate analysis between team members",
-                                "Provide comprehensive responses",
-                                "Ensure all recommendations are properly sourced",
-                                "Reference specific parts of the uploaded document",
-                                "Always search the knowledge base before delegating tasks"
-                            ],
-                            show_tool_calls=True,
-                            markdown=True
-                        )
-                        
-                        st.success("✅ Document processed and team initialized!")
+            # Multiple file uploader
+            uploaded_files = st.file_uploader(
+                "Upload Legal Documents", 
+                type=['pdf'],
+                accept_multiple_files=True
+            )
+            
+            # Track uploaded files in session state
+            if uploaded_files:
+                new_files = [f for f in uploaded_files if f.name not in st.session_state.processed_files]
+                if new_files:
+                    with st.spinner(f"Processing {len(new_files)} new document(s)..."):
+                        try:
+                            knowledge_base = process_documents(new_files, st.session_state.vector_db)
+                            st.session_state.knowledge_base = knowledge_base
+                            st.session_state.legal_team = init_legal_team(knowledge_base)
                             
-                    except Exception as e:
-                        st.error(f"Error processing document: {str(e)}")
+                            # Update processed files list
+                            st.session_state.processed_files.update(f.name for f in new_files)
+                            st.success(f"✅ {len(new_files)} new document(s) processed!")
+                            
+                        except Exception as e:
+                            st.error(f"Error processing documents: {str(e)}")
 
+            st.divider()
+            st.header("📚 Knowledge Base")
+            
+            # Create expandable section for document details
+            if st.session_state.processed_files:
+                # Display document count
+                doc_count = len(st.session_state.processed_files)
+                st.write(f"Total Documents: {doc_count}")
+                
+                # Create expandable section for each document
+                for idx, filename in enumerate(sorted(st.session_state.processed_files), 1):
+                    with st.expander(f"📄 {filename}"):
+                        st.write(f"Document #{idx} in Knowledge Base")
+                        if st.button(f"Remove {filename}", key=f"remove_{filename}"):
+                            st.session_state.processed_files.remove(filename)
+                            st.experimental_rerun()
+                
+                # Add option to clear all documents
+                if st.button("🗑️ Clear All Documents", type="secondary"):
+                    st.session_state.processed_files.clear()
+                    st.session_state.knowledge_base = None
+                    st.session_state.legal_team = None
+                    st.experimental_rerun()
+            else:
+                st.info("No documents in knowledge base yet")
+            
             st.divider()
             st.header("🔍 Analysis Options")
             analysis_type = st.selectbox(
                 "Select Analysis Type",
                 [
+                    "Document Comparison",
                     "Contract Review",
                     "Legal Research",
                     "Risk Assessment",
@@ -237,11 +282,12 @@ def main():
     # Main content area
     if not all([st.session_state.openai_api_key, st.session_state.vector_db]):
         st.info("👈 Please configure your API credentials in the sidebar to begin")
-    elif not uploaded_file:
-        st.info("👈 Please upload a legal document to begin analysis")
+    elif not st.session_state.processed_files:
+        st.info("👈 Please upload at least one legal document to begin analysis")
     elif st.session_state.legal_team:
         # Analysis icons dictionary
         analysis_icons = {
+            "Document Comparison": "🔄",
             "Contract Review": "📑",
             "Legal Research": "🔍",
             "Risk Assessment": "⚠️",
@@ -249,26 +295,31 @@ def main():
             "Custom Query": "💭"
         }
 
-        st.header(f"{analysis_icons[analysis_type]} {analysis_type} Analysis")
+        st.header(f"{analysis_icons[analysis_type]} {analysis_type}")
   
         analysis_configs = {
+            "Document Comparison": {
+                "query": "Compare and analyze the relationships between all uploaded documents. Identify any conflicts, overlaps, or dependencies.",
+                "agents": ["Contract Analyst", "Legal Strategist"],
+                "description": "Cross-document analysis and comparison"
+            },
             "Contract Review": {
-                "query": "Review this contract and identify key terms, obligations, and potential issues.",
+                "query": "Review all contracts and identify key terms, obligations, and potential issues.",
                 "agents": ["Contract Analyst"],
                 "description": "Detailed contract analysis focusing on terms and obligations"
             },
             "Legal Research": {
-                "query": "Research relevant cases and precedents related to this document.",
+                "query": "Research relevant cases and precedents related to these documents.",
                 "agents": ["Legal Researcher"],
                 "description": "Research on relevant legal cases and precedents"
             },
             "Risk Assessment": {
-                "query": "Analyze potential legal risks and liabilities in this document.",
+                "query": "Analyze potential legal risks and liabilities across all documents.",
                 "agents": ["Contract Analyst", "Legal Strategist"],
                 "description": "Combined risk analysis and strategic assessment"
             },
             "Compliance Check": {
-                "query": "Check this document for regulatory compliance issues.",
+                "query": "Check all documents for regulatory compliance issues.",
                 "agents": ["Legal Researcher", "Contract Analyst", "Legal Strategist"],
                 "description": "Comprehensive compliance analysis"
             },
@@ -294,26 +345,26 @@ def main():
             if analysis_type == "Custom Query" and not user_query:
                 st.warning("Please enter a query")
             else:
-                with st.spinner("Analyzing document..."):
+                with st.spinner("Analyzing documents..."):
                     try:
                         os.environ['OPENAI_API_KEY'] = st.session_state.openai_api_key
                         
                         if analysis_type != "Custom Query":
                             combined_query = f"""
-                            Using the uploaded document as reference:
+                            Using all uploaded documents as reference:
                             
                             Primary Analysis Task: {analysis_configs[analysis_type]['query']}
                             Focus Areas: {', '.join(analysis_configs[analysis_type]['agents'])}
                             
-                            Please search the knowledge base and provide specific references from the document.
+                            Please search the knowledge base and provide specific references from all documents.
                             """
                         else:
                             combined_query = f"""
-                            Using the uploaded document as reference:
+                            Using all uploaded documents as reference:
                             
                             {user_query}
                             
-                            Please search the knowledge base and provide specific references from the document.
+                            Please search the knowledge base and provide specific references from all documents.
                             Focus Areas: {', '.join(analysis_configs[analysis_type]['agents'])}
                             """
 
