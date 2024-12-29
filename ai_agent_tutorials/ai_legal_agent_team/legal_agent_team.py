@@ -8,7 +8,6 @@ from phi.embedder.openai import OpenAIEmbedder
 import tempfile
 import os
 
-#initializing the session state variables
 def init_session_state():
     """Initialize session state variables"""
     if 'openai_api_key' not in st.session_state:
@@ -31,14 +30,21 @@ def init_qdrant():
     if not st.session_state.qdrant_url:
         raise ValueError("Qdrant URL not provided")
         
-    return Qdrant(          
-        collection="legal_knowledge",
-        url=st.session_state.qdrant_url,
-        api_key=st.session_state.qdrant_api_key,
-        https=True,
-        timeout=None,
-        distance="cosine"
-    )
+    try:
+        vector_db = Qdrant(          
+            collection="legal_knowledge",
+            url=st.session_state.qdrant_url,
+            api_key=st.session_state.qdrant_api_key,
+            https=True,
+            timeout=60,  # Added explicit timeout
+            distance="cosine"
+        )
+        
+        # Test connection
+        vector_db.client.get_collections()
+        return vector_db
+    except Exception as e:
+        raise Exception(f"Failed to initialize Qdrant: {str(e)}")
 
 def process_document(uploaded_file, vector_db: Qdrant):
     """Process document, create embeddings and store in Qdrant vector database"""
@@ -48,30 +54,45 @@ def process_document(uploaded_file, vector_db: Qdrant):
     os.environ['OPENAI_API_KEY'] = st.session_state.openai_api_key
     
     with tempfile.TemporaryDirectory() as temp_dir:
-      
-        temp_file_path = os.path.join(temp_dir, uploaded_file.name)
-        with open(temp_file_path, "wb") as f:
-            f.write(uploaded_file.getbuffer())
-
         try:
-       
+            if uploaded_file is None:
+                raise ValueError("No file uploaded")
+                
+            if uploaded_file.size > 200 * 1024 * 1024:  # 200MB limit
+                raise ValueError("File size exceeds 200MB limit")
+            
+            temp_file_path = os.path.join(temp_dir, uploaded_file.name)
+            with open(temp_file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+            if not os.path.exists(temp_file_path):
+                raise ValueError("Failed to save uploaded file")
+
             embedder = OpenAIEmbedder(
                 model="text-embedding-3-small",
                 api_key=st.session_state.openai_api_key
             )
             
-            # Creating knowledge base with explicit Qdrant configuration
-            knowledge_base = PDFKnowledgeBase(
-                path=temp_dir, 
-                vector_db=vector_db, 
-                reader=PDFReader(chunk=True),
-                embedder=embedder,
-                recreate_vector_db=True  
-            )
-            knowledge_base.load()     
-            return knowledge_base      
+            try:
+                knowledge_base = PDFKnowledgeBase(
+                    path=temp_dir, 
+                    vector_db=vector_db, 
+                    reader=PDFReader(chunk=True),
+                    embedder=embedder,
+                    recreate_vector_db=True  
+                )
+                knowledge_base.load()
+                return knowledge_base
+                
+            except Exception as kb_error:
+                raise Exception(f"Error creating knowledge base: {str(kb_error)}")
+                
         except Exception as e:
-            raise Exception(f"Error processing document: {str(e)}")
+            error_msg = f"Error processing document: {str(e)}\n"
+            if hasattr(e, 'response'):
+                error_msg += f"Response status: {e.response.status_code}\n"
+                error_msg += f"Response content: {e.response.content}"
+            raise Exception(error_msg)
 
 def main():
     st.set_page_config(page_title="Legal Document Analyzer", layout="wide")
@@ -102,7 +123,7 @@ def main():
 
         qdrant_url = st.text_input(
             "Qdrant URL",
-            value=st.session_state.qdrant_url if st.session_state.qdrant_url else "https://f499085c-b4bf-4bda-a9a5-227f62a9ca20.us-west-2-0.aws.cloud.qdrant.io:6333",
+            value=st.session_state.qdrant_url if st.session_state.qdrant_url else "https://69792e3c-ca29-4963-983e-b6d9803d0a76.us-east4-0.gcp.cloud.qdrant.io:6333",
             help="Enter your Qdrant instance URL"
         )
         if qdrant_url:
@@ -128,11 +149,11 @@ def main():
                         knowledge_base = process_document(uploaded_file, st.session_state.vector_db)
                         st.session_state.knowledge_base = knowledge_base
                         
-                        # Initialize agents
+                        # Initialize agents with corrected model name
                         legal_researcher = Agent(
                             name="Legal Researcher",
                             role="Legal research specialist",
-                            model=OpenAIChat(model="gpt-4o"),
+                            model=OpenAIChat(model="gpt-4"),  # Fixed model name
                             tools=[DuckDuckGo()],
                             knowledge=st.session_state.knowledge_base,
                             search_knowledge=True,
@@ -149,7 +170,7 @@ def main():
                         contract_analyst = Agent(
                             name="Contract Analyst",
                             role="Contract analysis specialist",
-                            model=OpenAIChat(model="gpt-4o"),
+                            model=OpenAIChat(model="gpt-4"),  # Fixed model name
                             knowledge=knowledge_base,
                             search_knowledge=True,
                             instructions=[
@@ -163,7 +184,7 @@ def main():
                         legal_strategist = Agent(
                             name="Legal Strategist", 
                             role="Legal strategy specialist",
-                            model=OpenAIChat(model="gpt-4o"),
+                            model=OpenAIChat(model="gpt-4"),  # Fixed model name
                             knowledge=knowledge_base,
                             search_knowledge=True,
                             instructions=[
@@ -178,7 +199,7 @@ def main():
                         st.session_state.legal_team = Agent(
                             name="Legal Team Lead",
                             role="Legal team coordinator",
-                            model=OpenAIChat(model="gpt-4o"),
+                            model=OpenAIChat(model="gpt-4"),  # Fixed model name
                             team=[legal_researcher, contract_analyst, legal_strategist],
                             knowledge=st.session_state.knowledge_base,
                             search_knowledge=True,
@@ -219,7 +240,7 @@ def main():
     elif not uploaded_file:
         st.info("👈 Please upload a legal document to begin analysis")
     elif st.session_state.legal_team:
-        # Create a dictionary for analysis type icons
+        # Analysis icons dictionary
         analysis_icons = {
             "Contract Review": "📑",
             "Legal Research": "🔍",
@@ -228,7 +249,6 @@ def main():
             "Custom Query": "💭"
         }
 
-        # Dynamic header with icon
         st.header(f"{analysis_icons[analysis_type]} {analysis_type} Analysis")
   
         analysis_configs = {
@@ -260,17 +280,15 @@ def main():
         }
 
         st.info(f"📋 {analysis_configs[analysis_type]['description']}")
-        st.write(f"🤖 Active Legal AI Agents: {', '.join(analysis_configs[analysis_type]['agents'])}")  #dictionary!!
+        st.write(f"🤖 Active Legal AI Agents: {', '.join(analysis_configs[analysis_type]['agents'])}")
 
-        # Replace the existing user_query section with this:
         if analysis_type == "Custom Query":
             user_query = st.text_area(
                 "Enter your specific query:",
                 help="Add any specific questions or points you want to analyze"
             )
         else:
-            user_query = None  # Set to None for non-custom queries
-
+            user_query = None
 
         if st.button("Analyze"):
             if analysis_type == "Custom Query" and not user_query:
@@ -278,10 +296,8 @@ def main():
             else:
                 with st.spinner("Analyzing document..."):
                     try:
-                        # Ensure OpenAI API key is set
                         os.environ['OPENAI_API_KEY'] = st.session_state.openai_api_key
                         
-                        # Combine predefined and user queries
                         if analysis_type != "Custom Query":
                             combined_query = f"""
                             Using the uploaded document as reference:
@@ -353,4 +369,4 @@ def main():
         st.info("Please upload a legal document to begin analysis")
 
 if __name__ == "__main__":
-    main() 
+    main()
